@@ -1,0 +1,36 @@
+name: macOS
+
+on:
+  push:
+    branches:
+      - master
+    paths-ignore:
+      - 'docs/**'
+      - 'htdocs/**'
+      - 'web-src/**'
+  pull_request:
+    branches:
+      - master
+    paths-ignore:
+      - 'docs/**'
+      - 'htdocs/**'
+      - 'web-src/**'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Prepare test run
+      run: |
+        mkdir -p $HOME/owntone_data/media
+        sed -i '' 's/uid = "owntone"/uid = ${USER}/g' $HOME/owntone_data/etc/owntone.conf
+        sed -i '' 's/loglevel = log/loglevel = debug/g' $HOME/owntone_data/etc/owntone.conf
+        sed -i '' 's/directories = { "\/srv\/music" }/directories = { "${HOME}\/owntone_data\/media" }/g' $HOME/owntone_data/etc/owntone.conf
+
+    - name: Test run
+      run: |
+        $HOME/owntone_data/usr/sbin/owntone -f -t
