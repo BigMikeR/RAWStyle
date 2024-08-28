@@ -24,6 +24,22 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     
+    - name: Install libinotify-kqueue
+      # brew does not have libinotify package
+      run: |
+        git clone https://github.com/libinotify-kqueue/libinotify-kqueue
+        cd libinotify-kqueue
+        autoreconf -fvi
+        ./configure
+        make
+        sudo make install
+        cd ..
+
+    - name: Install other dependencies
+      # libxml2 is included with macOS
+      run: |
+        brew install libunistring confuse libplist libwebsockets libevent libgcrypt json-c protobuf-c libsodium gnutls pulseaudio openssl ffmpeg sqlite
+
     - name: Configure
       # We configure a non-privileged setup, since how to add a "owntone" system
       # user in macOS isn't clear to me (useradd etc. isn't available)
