@@ -2,6 +2,7 @@
 rawstyle — apply your photographic style to Sony ARW files.
 
 Commands:
+  config   Get / set global configuration (db path, etc.)
   index    Build / update the reference library index
   process  Process ARW files using the indexed style library
   inspect  Show which references match a given ARW file
@@ -10,27 +11,97 @@ Commands:
 """
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
 import click
 
-DEFAULT_DB = Path.home() / ".rawstyle" / "library.db"
+# ---------------------------------------------------------------------------
+# Config helpers
+# ---------------------------------------------------------------------------
+
+CONFIG_DIR  = Path.home() / ".rawstyle"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+_FALLBACK_DB = CONFIG_DIR / "library.db"
+
+
+def _load_config() -> dict:
+    if CONFIG_FILE.exists():
+        try:
+            return json.loads(CONFIG_FILE.read_text())
+        except Exception:
+            pass
+    return {}
+
+
+def _save_config(data: dict) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(json.dumps(data, indent=2))
+
+
+def _default_db() -> Path:
+    """Return the configured DB path, falling back to ~/.rawstyle/library.db."""
+    cfg = _load_config()
+    return Path(cfg["db"]) if "db" in cfg else _FALLBACK_DB
+
+
+def _resolve_db(db_option: Path | None) -> Path:
+    """
+    If the user passed --db explicitly, use that and persist it to config.
+    Otherwise use the configured default.
+    """
+    if db_option is not None:
+        _save_config({**_load_config(), "db": str(db_option)})
+        return db_option
+    return _default_db()
 
 
 def _require_db(db_path: Path) -> None:
     if not db_path.exists():
         click.echo(
             f"Library not found at {db_path}.\n"
-            "Run `rawstyle index <LIBRARY_DIR>` first.",
+            "Run `rawstyle index <LIBRARY_DIR>` first, or set the DB path with:\n"
+            "  rawstyle config set-db <PATH>",
             err=True,
         )
         sys.exit(1)
 
 
+# ---------------------------------------------------------------------------
+# CLI group
+# ---------------------------------------------------------------------------
+
 @click.group()
 def main():
     """rawstyle: content-aware RAW photo style transfer."""
+
+
+# ---------------------------------------------------------------------------
+# config
+# ---------------------------------------------------------------------------
+
+@main.group()
+def config():
+    """View or update rawstyle configuration."""
+
+
+@config.command("set-db")
+@click.argument("db_path", type=click.Path(path_type=Path))
+def config_set_db(db_path):
+    """Set the default path to the library database."""
+    db_path = db_path.expanduser().resolve()
+    _save_config({**_load_config(), "db": str(db_path)})
+    click.echo(f"Default library DB set to: {db_path}")
+
+
+@config.command("show")
+def config_show():
+    """Show current configuration."""
+    cfg = _load_config()
+    db = cfg.get("db", str(_FALLBACK_DB)) + (" (default)" if "db" not in cfg else "")
+    click.echo(f"Config file:  {CONFIG_FILE}")
+    click.echo(f"Library DB:   {db}")
 
 
 # ---------------------------------------------------------------------------
@@ -39,7 +110,8 @@ def main():
 
 @main.command()
 @click.argument("library_dir", type=click.Path(exists=True, file_okay=False, path_type=Path))
-@click.option("--db", default=DEFAULT_DB, type=click.Path(path_type=Path), show_default=True, help="Path to SQLite library DB")
+@click.option("--db", default=None, type=click.Path(path_type=Path),
+              help="Path to SQLite library DB (saved as new default if provided)")
 @click.option("--force", is_flag=True, help="Re-index all files, ignoring mtime cache")
 @click.option("--batch-size", default=64, show_default=True, help="CLIP embedding batch size")
 @click.option("--model", default="ViT-B-32", show_default=True, help="CLIP model variant")
@@ -53,7 +125,9 @@ def index(library_dir, db, force, batch_size, model, verbose):
     from rawstyle.utils.image_utils import find_jpeg_files, open_jpeg
     from rawstyle.utils.progress import bar
 
+    db = _resolve_db(db)
     db.parent.mkdir(parents=True, exist_ok=True)
+    click.echo(f"Using library DB: {db}")
     conn = open_db(db)
 
     jpegs = find_jpeg_files(library_dir)
@@ -63,7 +137,6 @@ def index(library_dir, db, force, batch_size, model, verbose):
 
     click.echo(f"Found {len(jpegs)} JPEG files in {library_dir}")
 
-    # Filter to files that need (re-)indexing
     to_index = []
     for path in jpegs:
         mtime = path.stat().st_mtime
@@ -76,7 +149,6 @@ def index(library_dir, db, force, batch_size, model, verbose):
 
     click.echo(f"Indexing {len(to_index)} files...")
 
-    # Extract style features and compute embeddings in batches
     paths_batch = [p for p, _ in to_index]
     mtimes_batch = [m for _, m in to_index]
 
@@ -92,7 +164,6 @@ def index(library_dir, db, force, batch_size, model, verbose):
             click.echo(f"  Skipping {path.name}: {exc}", err=True)
             failed.append(path)
 
-    # Remove failed paths from the batch
     valid = [(p, m, s) for (p, m), s, _ in zip(to_index, styles, range(len(styles)))
              if p not in failed]
     valid_paths = [p for p, _, _ in valid]
@@ -127,7 +198,8 @@ def index(library_dir, db, force, batch_size, model, verbose):
 @main.command()
 @click.argument("input_dir", type=click.Path(exists=True, file_okay=False, path_type=Path))
 @click.argument("output_dir", type=click.Path(file_okay=False, path_type=Path))
-@click.option("--db", default=DEFAULT_DB, type=click.Path(path_type=Path), show_default=True)
+@click.option("--db", default=None, type=click.Path(path_type=Path),
+              help="Path to SQLite library DB (overrides configured default)")
 @click.option("--k", default=5, show_default=True, help="Number of reference images to blend")
 @click.option("--temperature", default=0.15, show_default=True, help="Softmax blend temperature")
 @click.option("--quality", default=95, show_default=True, help="Output JPEG quality (1-100)")
@@ -136,18 +208,12 @@ def index(library_dir, db, force, batch_size, model, verbose):
 @click.option("--verbose", is_flag=True)
 def process(input_dir, output_dir, db, k, temperature, quality, pattern, dry_run, verbose):
     """Process ARW files and apply matched style from the reference library."""
-    from PIL import Image
-
-    from rawstyle.core.clip_embedder import embed_image
-    from rawstyle.core.exif_handler import copy_exif, exiftool_available
-    from rawstyle.core.raw_developer import develop_linear, develop_thumbnail
-    from rawstyle.core.style_applier import apply as apply_style
-    from rawstyle.core.style_blender import blend
-    from rawstyle.db.retriever import find_similar
+    from rawstyle.core.exif_handler import exiftool_available
     from rawstyle.db.schema import open_db
     from rawstyle.utils.image_utils import find_arw_files
     from rawstyle.utils.progress import bar
 
+    db = _resolve_db(db)
     _require_db(db)
     conn = open_db(db)
 
@@ -165,6 +231,7 @@ def process(input_dir, output_dir, db, k, temperature, quality, pattern, dry_run
                 err=True,
             )
 
+    click.echo(f"Using library DB: {db}")
     click.echo(f"Processing {len(arw_files)} ARW files...")
 
     for arw_path in bar(arw_files, desc="Processing", verbose=not verbose):
@@ -196,11 +263,9 @@ def _process_one(arw_path, output_dir, conn, k, temperature, quality, dry_run, v
     from rawstyle.db.retriever import find_similar
     from PIL import Image
 
-    # 1. Develop thumbnail for CLIP embedding
     thumb = develop_thumbnail(arw_path)
     embedding = embed_image(thumb)
 
-    # 2. Find K most similar reference images
     matches = find_similar(conn, embedding, k=k)
     if not matches:
         click.echo(f"  {arw_path.name}: no matches in library, skipping.", err=True)
@@ -215,21 +280,15 @@ def _process_one(arw_path, output_dir, conn, k, temperature, quality, dry_run, v
     if dry_run:
         return
 
-    # 3. Blend styles
     style_matches = [(m.style, m.distance) for m in matches]
     blended = blend(style_matches, temperature=temperature)
 
-    # 4. Develop full-resolution linear image
     linear = develop_linear(arw_path)
-
-    # 5. Apply style
     result_uint8 = apply_style(linear, blended)
 
-    # 6. Save JPEG
     out_path = output_dir / (arw_path.stem + ".jpg")
     Image.fromarray(result_uint8).save(str(out_path), format="JPEG", quality=quality, subsampling=0)
 
-    # 7. Copy EXIF from ARW
     copy_exif(arw_path, out_path)
 
 
@@ -239,7 +298,8 @@ def _process_one(arw_path, output_dir, conn, k, temperature, quality, dry_run, v
 
 @main.command()
 @click.argument("arw_file", type=click.Path(exists=True, dir_okay=False, path_type=Path))
-@click.option("--db", default=DEFAULT_DB, type=click.Path(path_type=Path), show_default=True)
+@click.option("--db", default=None, type=click.Path(path_type=Path),
+              help="Path to SQLite library DB (overrides configured default)")
 @click.option("--k", default=5, show_default=True)
 @click.option("--verbose", is_flag=True, help="Show style feature values")
 def inspect(arw_file, db, k, verbose):
@@ -250,9 +310,11 @@ def inspect(arw_file, db, k, verbose):
     from rawstyle.db.retriever import find_similar
     from rawstyle.db.schema import open_db
 
+    db = _resolve_db(db)
     _require_db(db)
     conn = open_db(db)
 
+    click.echo(f"Using library DB: {db}")
     click.echo(f"Developing thumbnail for {arw_file.name}...")
     thumb = develop_thumbnail(arw_file)
     embedding = embed_image(thumb)
@@ -275,7 +337,6 @@ def inspect(arw_file, db, k, verbose):
             click.echo(f"       vibrancy={s.vibrancy:.3f}")
 
     if verbose:
-        # Show blended style
         style_matches = [(m.style, m.distance) for m in matches]
         blended = blend(style_matches)
         click.echo("\n  Blended style (what will be applied):")
@@ -293,25 +354,27 @@ def inspect(arw_file, db, k, verbose):
 # ---------------------------------------------------------------------------
 
 @main.command()
-@click.option("--db", default=DEFAULT_DB, type=click.Path(path_type=Path), show_default=True)
+@click.option("--db", default=None, type=click.Path(path_type=Path),
+              help="Path to SQLite library DB (overrides configured default)")
 def info(db):
     """Display library statistics."""
-    if not db.exists():
-        click.echo(f"No library found at {db}")
-        return
-
     from rawstyle.db.retriever import count_images
     from rawstyle.db.schema import open_db
+
+    db = _resolve_db(db)
+    if not db.exists():
+        click.echo(f"No library found at {db}")
+        click.echo("Run `rawstyle index <LIBRARY_DIR>` to create one.")
+        return
 
     conn = open_db(db)
     n = count_images(conn)
     conn.close()
 
-    import os
     size_mb = db.stat().st_size / 1024 / 1024
-    click.echo(f"Library:  {db}")
-    click.echo(f"Images:   {n}")
-    click.echo(f"DB size:  {size_mb:.1f} MB")
+    click.echo(f"Library DB:  {db}")
+    click.echo(f"Images:      {n}")
+    click.echo(f"DB size:     {size_mb:.1f} MB")
 
 
 # ---------------------------------------------------------------------------
@@ -319,20 +382,21 @@ def info(db):
 # ---------------------------------------------------------------------------
 
 @main.command()
-@click.option("--db", default=DEFAULT_DB, type=click.Path(path_type=Path), show_default=True)
+@click.option("--db", default=None, type=click.Path(path_type=Path),
+              help="Path to SQLite library DB (overrides configured default)")
 @click.option("--prune", is_flag=True, help="Remove entries for files that no longer exist")
 def reindex(db, prune):
     """Re-index all files or prune missing entries."""
-    _require_db(db)
-
     from rawstyle.db.schema import open_db
     from rawstyle.db.writer import prune_missing
 
+    db = _resolve_db(db)
+    _require_db(db)
     conn = open_db(db)
 
     if prune:
         removed = prune_missing(conn)
-        click.echo(f"Pruned {removed} missing entries.")
+        click.echo(f"Pruned {removed} missing entries from {db}")
     else:
         click.echo("Use `rawstyle index <LIBRARY_DIR> --force` to re-index all files.")
 
