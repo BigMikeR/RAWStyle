@@ -58,7 +58,26 @@ python3.11 -m pip install -e .
 
 ## Usage
 
-### Step 1 — Index your processed JPEG library
+### Step 1 — Set your library database path
+
+RAWStyle stores its index in a SQLite database. Set the path once and all commands will use it automatically:
+
+```bash
+rawstyle config set-db ~/Pictures/rawstyle.db
+```
+
+This saves the path to `~/.rawstyle/config.json`. You can check the current configuration at any time:
+
+```bash
+rawstyle config show
+```
+
+> If you never run `config set-db`, RAWStyle defaults to `~/.rawstyle/library.db`.
+> Any command also accepts `--db <PATH>` to override the configured path for that run — and will save it as the new default.
+
+---
+
+### Step 2 — Index your processed JPEG library
 
 Run this once (and again whenever you add new photos to your library):
 
@@ -66,13 +85,13 @@ Run this once (and again whenever you add new photos to your library):
 rawstyle index ~/Pictures/Processed/
 ```
 
-This scans all JPEGs in the folder, extracts style features and CLIP embeddings, and stores them in a local SQLite database at `~/.rawstyle/library.db`.
+This scans all JPEGs in the folder, extracts style features and CLIP embeddings, and stores them in the configured database.
 
 Options:
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--db PATH` | `~/.rawstyle/library.db` | Path to the library database |
+| `--db PATH` | configured default | Override the library database path (and save as new default) |
 | `--force` | off | Re-index all files, ignoring the modification time cache |
 | `--batch-size INT` | `64` | Number of images per CLIP embedding batch |
 | `--model TEXT` | `ViT-B-32` | CLIP model variant (`ViT-B-32` or `ViT-L-14` for higher accuracy) |
@@ -80,7 +99,7 @@ Options:
 
 ---
 
-### Step 2 — Process ARW files
+### Step 3 — Process ARW files
 
 ```bash
 rawstyle process ~/Shoots/2026-04/ ~/Shoots/2026-04/output/
@@ -92,7 +111,7 @@ Options:
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--db PATH` | `~/.rawstyle/library.db` | Path to the library database |
+| `--db PATH` | configured default | Override the library database path |
 | `--k INT` | `5` | Number of reference images to blend |
 | `--temperature FLOAT` | `0.15` | Blend sharpness — lower values favour the closest match more strongly |
 | `--quality INT` | `95` | Output JPEG quality (1–100) |
@@ -130,6 +149,17 @@ rawstyle reindex --prune
 
 ---
 
+## Configuration
+
+RAWStyle stores its configuration in `~/.rawstyle/config.json`. The only setting currently stored is the library database path.
+
+| Command | Description |
+|---------|-------------|
+| `rawstyle config set-db <PATH>` | Set the default library database path |
+| `rawstyle config show` | Display the current configuration |
+
+---
+
 ## Tips
 
 - **More accurate matching** — Use `--model ViT-L-14` when indexing for better semantic discrimination. Re-index with `--force` if you switch models.
@@ -142,7 +172,10 @@ rawstyle reindex --prune
 ## Example workflow
 
 ```bash
-# Index your library
+# Set the library DB path once
+rawstyle config set-db ~/Pictures/rawstyle.db
+
+# Index your processed JPEG library
 rawstyle index ~/Pictures/Processed/ --verbose
 
 # Preview what would be applied to a single shot
