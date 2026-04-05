@@ -109,20 +109,33 @@ def config_show():
 # ---------------------------------------------------------------------------
 
 @main.command()
-@click.argument("library_dir", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.argument("jpeg_dir", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option("--arw-dir", default=None, type=click.Path(exists=True, file_okay=False, path_type=Path),
+              help="Folder of original ARW files mirroring JPEG_DIR subfolders. "
+                   "When provided, style is derived from direct before/after comparison (more accurate).")
 @click.option("--db", default=None, type=click.Path(path_type=Path),
               help="Path to SQLite library DB (saved as new default if provided)")
 @click.option("--force", is_flag=True, help="Re-index all files, ignoring mtime cache")
 @click.option("--batch-size", default=64, show_default=True, help="CLIP embedding batch size")
 @click.option("--model", default="ViT-B-32", show_default=True, help="CLIP model variant")
 @click.option("--verbose", is_flag=True)
-def index(library_dir, db, force, batch_size, model, verbose):
-    """Build or update the reference JPEG library index."""
+def index(jpeg_dir, arw_dir, db, force, batch_size, model, verbose):
+    """Build or update the reference JPEG library index.
+
+    JPEG_DIR is your folder of processed JPEG files (searched recursively).
+
+    If --arw-dir is supplied, each JPEG is matched to its original ARW by
+    filename across the mirrored folder structure. The style is then measured
+    as the direct difference between the neutral RAW development and the
+    processed JPEG, giving significantly more accurate results.
+
+    Without --arw-dir, style features are estimated from the JPEG alone.
+    """
     from rawstyle.db.schema import open_db
     from rawstyle.db.writer import needs_reindex, upsert_image
     from rawstyle.core.clip_embedder import embed_batch
-    from rawstyle.core.style_extractor import extract as extract_style
-    from rawstyle.utils.image_utils import find_jpeg_files, open_jpeg
+    from rawstyle.core.style_extractor import extract as extract_style, extract_from_pair
+    from rawstyle.utils.image_utils import find_jpeg_files, find_jpeg_arw_pairs, open_jpeg
     from rawstyle.utils.progress import bar
 
     db = _resolve_db(db)
@@ -130,65 +143,86 @@ def index(library_dir, db, force, batch_size, model, verbose):
     click.echo(f"Using library DB: {db}")
     conn = open_db(db)
 
-    jpegs = find_jpeg_files(library_dir)
-    if not jpegs:
-        click.echo("No JPEG files found.", err=True)
-        sys.exit(1)
+    # --- Build the list of (jpeg_path, arw_path_or_None) to process ---
+    if arw_dir:
+        pairs, unmatched = find_jpeg_arw_pairs(jpeg_dir, arw_dir)
+        if not pairs:
+            click.echo("No matching JPEG/ARW pairs found. Check that filenames "
+                       "match across both folders.", err=True)
+            sys.exit(1)
+        click.echo(f"Found {len(pairs)} matched JPEG/ARW pairs in {jpeg_dir}")
+        if unmatched:
+            click.echo(f"  ({len(unmatched)} JPEGs had no matching ARW — skipped)")
+        work_items = [(jpeg, arw) for jpeg, arw in pairs]
+    else:
+        jpegs = find_jpeg_files(jpeg_dir)
+        if not jpegs:
+            click.echo("No JPEG files found.", err=True)
+            sys.exit(1)
+        click.echo(f"Found {len(jpegs)} JPEG files in {jpeg_dir} (JPEG-only mode)")
+        work_items = [(jpeg, None) for jpeg in jpegs]
 
-    click.echo(f"Found {len(jpegs)} JPEG files in {library_dir}")
-
+    # --- Filter to files that need (re-)indexing ---
     to_index = []
-    for path in jpegs:
-        mtime = path.stat().st_mtime
-        if force or needs_reindex(conn, str(path), mtime):
-            to_index.append((path, mtime))
+    for jpeg_path, arw_path in work_items:
+        mtime = jpeg_path.stat().st_mtime
+        if force or needs_reindex(conn, str(jpeg_path), mtime):
+            to_index.append((jpeg_path, arw_path, mtime))
 
     if not to_index:
         click.echo("All files already indexed and up to date.")
+        conn.close()
         return
 
-    click.echo(f"Indexing {len(to_index)} files...")
+    click.echo(f"Indexing {len(to_index)} files"
+               + (" using ARW/JPEG pair comparison..." if arw_dir else " using JPEG-only mode..."))
 
-    paths_batch = [p for p, _ in to_index]
-    mtimes_batch = [m for _, m in to_index]
+    # --- Extract style features ---
+    images  = []   # PIL images for CLIP embedding (always the JPEG)
+    styles  = []
+    paths   = []
+    mtimes  = []
+    failed  = []
 
-    images = []
-    styles = []
-    failed = []
-    for path in bar(paths_batch, desc="Loading JPEGs", verbose=verbose):
+    for jpeg_path, arw_path, mtime in bar(to_index, desc="Extracting style", verbose=verbose):
         try:
-            img = open_jpeg(path)
-            images.append(img)
-            styles.append(extract_style(img))
+            jpeg_img = open_jpeg(jpeg_path)
+            if arw_path is not None:
+                style = extract_from_pair(arw_path, jpeg_path)
+            else:
+                style = extract_style(jpeg_img)
+            images.append(jpeg_img)
+            styles.append(style)
+            paths.append(jpeg_path)
+            mtimes.append(mtime)
         except Exception as exc:
-            click.echo(f"  Skipping {path.name}: {exc}", err=True)
-            failed.append(path)
+            click.echo(f"  Skipping {jpeg_path.name}: {exc}", err=True)
+            failed.append(jpeg_path)
 
-    valid = [(p, m, s) for (p, m), s, _ in zip(to_index, styles, range(len(styles)))
-             if p not in failed]
-    valid_paths = [p for p, _, _ in valid]
-    valid_mtimes = [m for _, m, _ in valid]
-    valid_styles = [s for _, _, s in valid]
-    valid_images = [img for path, img in zip(paths_batch, images) if path not in failed]
-
-    if not valid_images:
+    if not images:
         click.echo("No files could be loaded.", err=True)
+        conn.close()
         sys.exit(1)
 
-    click.echo(f"Computing CLIP embeddings (model={model})...")
-    embeddings = embed_batch(valid_images, batch_size=batch_size, model_name=model)
+    if failed:
+        click.echo(f"  {len(failed)} file(s) skipped due to errors.")
 
+    # --- Compute CLIP embeddings on the JPEGs ---
+    click.echo(f"Computing CLIP embeddings (model={model})...")
+    embeddings = embed_batch(images, batch_size=batch_size, model_name=model)
+
+    # --- Write to DB ---
     click.echo("Writing to database...")
     for path, mtime, style, embedding in bar(
-        zip(valid_paths, valid_mtimes, valid_styles, embeddings),
+        zip(paths, mtimes, styles, embeddings),
         desc="Saving",
-        total=len(valid_paths),
+        total=len(paths),
         verbose=verbose,
     ):
         upsert_image(conn, str(path), mtime, embedding, style)
 
     conn.close()
-    click.echo(f"Done. Indexed {len(valid_paths)} images into {db}")
+    click.echo(f"Done. Indexed {len(paths)} images into {db}")
 
 
 # ---------------------------------------------------------------------------
