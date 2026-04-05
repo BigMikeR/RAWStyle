@@ -6,7 +6,22 @@ from __future__ import annotations
 
 import numpy as np
 
-from rawstyle.core.style_extractor import StyleFeature
+from rawstyle.core.style_extractor import StyleFeature, _identity_lut
+
+
+# Scalar fields blended by weighted average
+_SCALAR_FIELDS = [
+    "contrast", "shadow_lift", "highlight_comp", "color_temp_delta",
+    "sat_r", "sat_g", "sat_b", "vibrancy",
+    "hue_shift_r", "hue_shift_o", "hue_shift_y", "hue_shift_g",
+    "hue_shift_c", "hue_shift_b", "hue_shift_p", "hue_shift_m",
+    "lum_hue_r", "lum_hue_o", "lum_hue_y", "lum_hue_g",
+    "lum_hue_c", "lum_hue_b", "lum_hue_p", "lum_hue_m",
+    "vignette_strength", "clarity", "grain_strength",
+]
+
+# Array (LUT) fields blended element-wise
+_ARRAY_FIELDS = ["lum_curve", "curve_r", "curve_g", "curve_b"]
 
 
 def blend(
@@ -16,12 +31,8 @@ def blend(
     """
     Blend a list of (StyleFeature, distance) pairs.
 
-    `distance` is cosine distance in [0, 2] where 0 = identical.
-    `temperature` controls how sharply the closest match dominates:
-      - low T  (0.05) → winner-takes-almost-all
-      - high T (0.5)  → near-equal weighting
-
-    Returns a single blended StyleFeature.
+    distance  — cosine distance in [0, 2]; 0 = identical
+    temperature — softmax sharpness; lower = closer match dominates more
     """
     if not matches:
         raise ValueError("No matches to blend")
@@ -30,38 +41,27 @@ def blend(
         return matches[0][0]
 
     distances = np.array([d for _, d in matches], dtype=np.float32)
-    # Softmax with temperature: w_i = exp(-d_i / T)
-    log_weights = -distances / max(temperature, 1e-6)
-    log_weights -= log_weights.max()  # numerical stability
-    weights = np.exp(log_weights)
+    log_w = -distances / max(temperature, 1e-6)
+    log_w -= log_w.max()
+    weights = np.exp(log_w)
     weights /= weights.sum()
 
     features = [f for f, _ in matches]
 
-    # Weighted average of each scalar field
-    def wavg(attr):
+    def wavg(attr: str) -> float:
         return float(sum(w * getattr(f, attr) for w, f in zip(weights, features)))
 
-    # Weighted average of lum_curve arrays, then validate monotonicity
-    lum_curve = sum(w * f.lum_curve for w, f in zip(weights, features))
-    lum_curve = _ensure_monotonic(lum_curve.astype(np.float32))
+    def arr_avg(attr: str) -> np.ndarray:
+        blended = sum(w * getattr(f, attr) for w, f in zip(weights, features))
+        return _ensure_monotonic(blended.astype(np.float32))
 
-    return StyleFeature(
-        lum_curve=lum_curve,
-        shadow_lift=wavg("shadow_lift"),
-        highlight_comp=wavg("highlight_comp"),
-        sat_r=wavg("sat_r"),
-        sat_g=wavg("sat_g"),
-        sat_b=wavg("sat_b"),
-        vibrancy=wavg("vibrancy"),
-    )
+    scalars = {field: wavg(field) for field in _SCALAR_FIELDS}
+    arrays  = {field: arr_avg(field) for field in _ARRAY_FIELDS}
+
+    return StyleFeature(**scalars, **arrays)
 
 
 def _ensure_monotonic(curve: np.ndarray) -> np.ndarray:
-    """
-    Enforce non-decreasing values in the LUT using a cumulative max pass.
-    This is a safety net; PCHIP-extracted curves should already be monotonic.
-    """
     out = curve.copy()
     for i in range(1, len(out)):
         if out[i] < out[i - 1]:

@@ -1,161 +1,268 @@
 """
 Apply a StyleFeature to a linearly-developed float32 RGB array.
 
-Input:  float32[H, W, 3] in [0.0, 1.0], scene-referred, linear light
-Output: uint8[H, W, 3]  sRGB gamma-encoded, ready for JPEG encoding
+Pipeline (all display-space operations after initial gamma encode):
+
+  Linear domain  →  gamma encode
+  Display domain →  lum_curve → per-channel curves → contrast
+                 →  shadow_lift → highlight_comp → color_temp
+                 →  HSV: hue_shifts, saturation, lum_per_hue, vibrancy
+                 →  clarity → vignette → grain
+                 →  uint8
 """
 from __future__ import annotations
 
 import numpy as np
+from scipy.ndimage import gaussian_filter
 
-from rawstyle.core.style_extractor import StyleFeature
+from rawstyle.core.style_extractor import StyleFeature, HSL_GROUPS, HSL_GROUP_KEYS
 
 
 def apply(linear_rgb: np.ndarray, style: StyleFeature) -> np.ndarray:
     """
     Apply `style` to `linear_rgb` and return a display-ready uint8 sRGB image.
+
+    Input:  float32[H, W, 3] in [0.0, 1.0], scene-referred linear light
+    Output: uint8[H, W, 3]  sRGB
     """
     img = np.clip(linear_rgb, 0.0, 1.0).astype(np.float32)
 
-    # -- Step 1: Luminance-preserving tone curve --
+    # ---- 1. Gamma encode (linear → display-referred) ----
+    img = _srgb_gamma(img)
+
+    # ---- 2. Luminance tone curve ----
     img = _apply_lum_curve(img, style.lum_curve)
 
-    # -- Step 2: Shadow lift --
+    # ---- 3. Per-channel R/G/B curves (colour grade / split toning) ----
+    img = _apply_channel_curves(img, style.curve_r, style.curve_g, style.curve_b)
+
+    # ---- 4. Contrast (midtone slope) ----
+    img = _apply_contrast(img, style.contrast)
+
+    # ---- 5. Shadow lift ----
     img = _apply_shadow_lift(img, style.shadow_lift)
 
-    # -- Step 3: Highlight compression --
+    # ---- 6. Highlight compression ----
     img = _apply_highlight_comp(img, style.highlight_comp)
+
+    # ---- 7. Colour temperature ----
+    img = _apply_color_temp(img, style.color_temp_delta)
 
     img = np.clip(img, 0.0, 1.0)
 
-    # -- Steps 4 & 5: Saturation + vibrancy in HSV space --
-    img = _apply_sat_vibrancy(img, style)
+    # ---- 8–11. HSV adjustments ----
+    img = _apply_hsv(img, style)
 
-    # -- Step 6: sRGB gamma encode --
-    img = _srgb_gamma(img)
+    # ---- 12. Clarity (midtone local contrast) ----
+    img = _apply_clarity(img, style.clarity)
 
-    # -- Step 7: → uint8 --
-    return (np.clip(img, 0.0, 1.0) * 255.0).round().astype(np.uint8)
+    # ---- 13. Vignette ----
+    img = _apply_vignette(img, style.vignette_strength)
+
+    img = np.clip(img, 0.0, 1.0)
+
+    # ---- 14. Convert to uint8 ----
+    result = (img * 255.0).round().astype(np.uint8)
+
+    # ---- 15. Grain (applied on uint8 as film grain) ----
+    result = _apply_grain(result, style.grain_strength)
+
+    return result
 
 
 # ---------------------------------------------------------------------------
-# Internal helpers
+# Step implementations
 # ---------------------------------------------------------------------------
 
-def _luminance(rgb: np.ndarray) -> np.ndarray:
-    """Perceptual luminance (BT.709), shape (H, W)."""
-    return 0.2126 * rgb[:, :, 0] + 0.7152 * rgb[:, :, 1] + 0.0722 * rgb[:, :, 2]
+def _luminance(img: np.ndarray) -> np.ndarray:
+    return 0.2126 * img[:,:,0] + 0.7152 * img[:,:,1] + 0.0722 * img[:,:,2]
+
+
+def _srgb_gamma(linear: np.ndarray) -> np.ndarray:
+    return np.where(
+        linear <= 0.0031308,
+        12.92 * linear,
+        1.055 * np.power(np.clip(linear, 0.0, 1.0), 1.0 / 2.4) - 0.055,
+    )
 
 
 def _apply_lum_curve(img: np.ndarray, lum_curve: np.ndarray) -> np.ndarray:
     lum = _luminance(img)
-    lum_idx = np.clip((lum * 255.0).astype(np.int32), 0, 255)
-    lum_out = lum_curve[lum_idx]                          # (H, W)
-    scale = np.where(lum > 1e-6, lum_out / lum, 1.0)     # (H, W)
-    return img * scale[:, :, np.newaxis]
+    idx = np.clip((lum * 255.0).astype(np.int32), 0, 255)
+    lum_out = lum_curve[idx]
+    scale = np.where(lum > 1e-6, lum_out / lum, 1.0)
+    return img * scale[:,:, np.newaxis]
+
+
+def _apply_channel_curves(
+    img: np.ndarray,
+    curve_r: np.ndarray,
+    curve_g: np.ndarray,
+    curve_b: np.ndarray,
+) -> np.ndarray:
+    result = img.copy()
+    for c, curve in enumerate([curve_r, curve_g, curve_b]):
+        idx = np.clip((img[:,:,c] * 255.0).astype(np.int32), 0, 255)
+        result[:,:,c] = curve[idx]
+    return result
+
+
+def _apply_contrast(img: np.ndarray, contrast: float) -> np.ndarray:
+    if abs(contrast - 1.0) < 0.02:
+        return img
+    lum = _luminance(img)
+    lum_new = np.clip(0.5 + (lum - 0.5) * contrast, 0.0, 1.0)
+    scale = np.where(lum > 1e-6, lum_new / lum, 1.0)
+    return img * scale[:,:, np.newaxis]
 
 
 def _apply_shadow_lift(img: np.ndarray, shadow_lift: float) -> np.ndarray:
     if abs(shadow_lift) < 1e-4:
         return img
     lum = _luminance(img)
-    # Smooth mask: full effect at lum=0, zero effect at lum=0.2+
     mask = np.clip(1.0 - lum / 0.2, 0.0, 1.0)
-    # shadow_lift is the mean luminance in shadows of the reference image;
-    # we add the difference between that and a "pure black" shadow baseline.
-    lift = (shadow_lift - 0.0) * mask
-    return img + lift[:, :, np.newaxis]
+    return img + (shadow_lift * mask)[:,:, np.newaxis]
 
 
 def _apply_highlight_comp(img: np.ndarray, highlight_comp: float) -> np.ndarray:
     if abs(highlight_comp) < 1e-4:
         return img
     lum = _luminance(img)
-    # Smooth mask: zero effect at lum=0.85, full effect at lum=1.0
     mask = np.clip((lum - 0.85) / 0.15, 0.0, 1.0)
-    pull = highlight_comp * mask
-    return img - pull[:, :, np.newaxis]
+    return img - (highlight_comp * mask)[:,:, np.newaxis]
 
+
+def _apply_color_temp(img: np.ndarray, delta: float) -> np.ndarray:
+    if abs(delta) < 0.005:
+        return img
+    result = img.copy()
+    result[:,:,0] = np.clip(img[:,:,0] * (1.0 + delta * 0.5), 0.0, 1.0)  # R
+    result[:,:,2] = np.clip(img[:,:,2] * (1.0 - delta * 0.5), 0.0, 1.0)  # B
+    return result
+
+
+def _apply_hsv(img: np.ndarray, style: StyleFeature) -> np.ndarray:
+    hsv = _rgb_to_hsv(img)
+    H, S, V = hsv[:,:,0].copy(), hsv[:,:,1].copy(), hsv[:,:,2].copy()
+
+    hue_shifts = [
+        style.hue_shift_r, style.hue_shift_o, style.hue_shift_y, style.hue_shift_g,
+        style.hue_shift_c, style.hue_shift_b, style.hue_shift_p, style.hue_shift_m,
+    ]
+    lum_muls = [
+        style.lum_hue_r, style.lum_hue_o, style.lum_hue_y, style.lum_hue_g,
+        style.lum_hue_c, style.lum_hue_b, style.lum_hue_p, style.lum_hue_m,
+    ]
+    sat_muls = {
+        "r": style.sat_r, "o": style.sat_r, "y": style.sat_r,   # red group
+        "g": style.sat_g, "c": style.sat_g,                      # green group
+        "b": style.sat_b, "p": style.sat_b, "m": style.sat_b,   # blue group
+    }
+
+    for key, hs, lm in zip(HSL_GROUP_KEYS, hue_shifts, lum_muls):
+        lo, hi = HSL_GROUPS[key]
+        if lo > hi:
+            mask = (H >= lo) | (H < hi)
+        else:
+            mask = (H >= lo) & (H < hi)
+
+        if not mask.any():
+            continue
+
+        # Hue shift
+        if abs(hs) > 0.1:
+            H[mask] = (H[mask] + hs) % 360.0
+
+        # Saturation multiplier (mapped from 3-group to 8-group)
+        sm = sat_muls[key]
+        if abs(sm - 1.0) > 0.01:
+            S[mask] = np.clip(S[mask] * sm, 0.0, 1.0)
+
+        # Luminance per hue group
+        if abs(lm - 1.0) > 0.01:
+            V[mask] = np.clip(V[mask] * lm, 0.0, 1.0)
+
+    # Vibrancy: boost low-saturation pixels selectively
+    if abs(style.vibrancy) > 1e-4:
+        S = np.clip(S + style.vibrancy * (1.0 - S), 0.0, 1.0)
+
+    hsv[:,:,0] = H
+    hsv[:,:,1] = S
+    hsv[:,:,2] = V
+    return _hsv_to_rgb(hsv)
+
+
+def _apply_clarity(img: np.ndarray, clarity: float) -> np.ndarray:
+    if abs(clarity) < 0.005:
+        return img
+    blurred = np.stack(
+        [gaussian_filter(img[:,:,c], sigma=8.0) for c in range(3)], axis=-1
+    )
+    highpass = img - blurred
+    lum = _luminance(img)
+    midtone_w = np.exp(-8.0 * (lum - 0.5) ** 2)[:,:, np.newaxis]
+    return np.clip(img + clarity * highpass * midtone_w, 0.0, 1.0)
+
+
+def _apply_vignette(img: np.ndarray, vignette_strength: float) -> np.ndarray:
+    if abs(vignette_strength) < 0.005:
+        return img
+    H, W = img.shape[:2]
+    y, x = np.mgrid[0:H, 0:W]
+    r = np.sqrt(((y - H/2) / (H/2))**2 + ((x - W/2) / (W/2))**2)
+    radial = np.clip(1.0 - r**2, 0.0, 1.0)
+    scale = np.clip(1.0 + vignette_strength * (1.0 - radial), 0.0, 2.0)
+    return img * scale[:,:, np.newaxis]
+
+
+def _apply_grain(img: np.ndarray, grain_strength: float) -> np.ndarray:
+    if grain_strength < 0.005:
+        return img
+    sigma = grain_strength * 255.0
+    noise = np.random.normal(0.0, sigma, img.shape).astype(np.float32)
+    return np.clip(img.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+
+
+# ---------------------------------------------------------------------------
+# Vectorised RGB ↔ HSV
+# ---------------------------------------------------------------------------
 
 def _rgb_to_hsv(rgb: np.ndarray) -> np.ndarray:
-    """Vectorised RGB→HSV.  Input/output float32 [0,1]."""
-    r, g, b = rgb[:, :, 0], rgb[:, :, 1], rgb[:, :, 2]
+    r, g, b = rgb[:,:,0], rgb[:,:,1], rgb[:,:,2]
     cmax = np.maximum(np.maximum(r, g), b)
     cmin = np.minimum(np.minimum(r, g), b)
     delta = cmax - cmin
 
-    # Hue
     h = np.zeros_like(r)
-    mask = delta > 1e-7
-    m_r = mask & (cmax == r)
-    m_g = mask & (cmax == g)
-    m_b = mask & (cmax == b)
-    h[m_r] = ((g[m_r] - b[m_r]) / delta[m_r]) % 6.0
-    h[m_g] = (b[m_g] - r[m_g]) / delta[m_g] + 2.0
-    h[m_b] = (r[m_b] - g[m_b]) / delta[m_b] + 4.0
-    h = h / 6.0  # normalise to [0, 1]
+    m = delta > 1e-7
+    mr = m & (cmax == r)
+    mg = m & (cmax == g)
+    mb = m & (cmax == b)
+    h[mr] = ((g[mr] - b[mr]) / delta[mr]) % 6.0
+    h[mg] = (b[mg] - r[mg]) / delta[mg] + 2.0
+    h[mb] = (r[mb] - g[mb]) / delta[mb] + 4.0
+    h = (h / 6.0) * 360.0  # convert to degrees
 
-    # Saturation
     s = np.where(cmax > 1e-7, delta / cmax, 0.0)
-
     return np.stack([h, s, cmax], axis=-1)
 
 
 def _hsv_to_rgb(hsv: np.ndarray) -> np.ndarray:
-    """Vectorised HSV→RGB.  Input/output float32 [0,1]."""
-    h, s, v = hsv[:, :, 0] * 6.0, hsv[:, :, 1], hsv[:, :, 2]
+    H_deg, S, V = hsv[:,:,0], hsv[:,:,1], hsv[:,:,2]
+    h = (H_deg / 360.0) * 6.0
     i = np.floor(h).astype(np.int32) % 6
     f = h - np.floor(h)
-    p = v * (1.0 - s)
-    q = v * (1.0 - f * s)
-    t = v * (1.0 - (1.0 - f) * s)
+    p = V * (1.0 - S)
+    q = V * (1.0 - f * S)
+    t = V * (1.0 - (1.0 - f) * S)
 
     rgb = np.zeros(hsv.shape, dtype=np.float32)
-    for idx, (r_val, g_val, b_val) in enumerate(
-        [(v, t, p), (q, v, p), (p, v, t), (p, q, v), (t, p, v), (v, p, q)]
+    for idx, (rv, gv, bv) in enumerate(
+        [(V, t, p), (q, V, p), (p, V, t), (p, q, V), (t, p, V), (V, p, q)]
     ):
         mask = i == idx
-        rgb[:, :, 0][mask] = r_val[mask]
-        rgb[:, :, 1][mask] = g_val[mask]
-        rgb[:, :, 2][mask] = b_val[mask]
+        rgb[:,:,0][mask] = rv[mask]
+        rgb[:,:,1][mask] = gv[mask]
+        rgb[:,:,2][mask] = bv[mask]
 
     return rgb
-
-
-def _apply_sat_vibrancy(img: np.ndarray, style: StyleFeature) -> np.ndarray:
-    hsv = _rgb_to_hsv(img)
-    H = hsv[:, :, 0] * 360.0  # degrees
-    S = hsv[:, :, 1]
-
-    # Per-hue saturation multipliers
-    sat_mul = np.ones_like(S)
-
-    # Reds / oranges / yellows: hue 0-30 and 330-360 (i.e. 0-0.083 and 0.917-1.0)
-    r_mask = (H < 30.0) | (H >= 330.0)
-    sat_mul[r_mask] *= style.sat_r
-
-    # Greens / cyans: 75-165 degrees
-    g_mask = (H >= 75.0) & (H < 165.0)
-    sat_mul[g_mask] *= style.sat_g
-
-    # Blues / magentas: 195-285 degrees
-    b_mask = (H >= 195.0) & (H < 285.0)
-    sat_mul[b_mask] *= style.sat_b
-
-    S_new = np.clip(S * sat_mul, 0.0, 1.0)
-
-    # Vibrancy: boost low-saturation pixels more
-    if abs(style.vibrancy) > 1e-4:
-        S_new = np.clip(S_new + style.vibrancy * (1.0 - S_new), 0.0, 1.0)
-
-    hsv[:, :, 1] = S_new
-    return _hsv_to_rgb(hsv)
-
-
-def _srgb_gamma(linear: np.ndarray) -> np.ndarray:
-    """IEC 61966-2-1 sRGB transfer function."""
-    return np.where(
-        linear <= 0.0031308,
-        12.92 * linear,
-        1.055 * np.power(np.clip(linear, 0.0, 1.0), 1.0 / 2.4) - 0.055,
-    )
